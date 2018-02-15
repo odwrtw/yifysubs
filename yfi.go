@@ -3,176 +3,190 @@ package yifysubs
 import (
 	"archive/zip"
 	"bytes"
-	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"io/ioutil"
-	"log"
 	"net/http"
-	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+
+	"github.com/jpillora/scraper/scraper"
+	"github.com/mitchellh/mapstructure"
 )
-
-// Endpoint of the API
-const APIEndpoint = "http://api.yifysubtitles.com/subs"
-
-// Subtitle download endpoint
-const SubtitleEndpoint = "http://www.yifysubtitles.com"
 
 // Errors
 var (
-	ErrNotSubtitleFound      = errors.New("yify: no subtitles found")
-	ErrMissingSubtitleURL    = errors.New("yify: missing subtitle URL")
-	ErrFileAlreadyDownloaded = errors.New("yify: file already downloaded")
-	ErrFailedToUnzip         = errors.New("yify: failed to unzip archive")
+	ErrNoSubtitleFound = errors.New("yify: no subtitles found")
 )
 
-// Response is the representation of a response from the YIFY subtitle API
-type Response struct {
-	SubtitlesCount int                              `json:"subtitles"`
-	Subtitles      map[string]map[string][]Subtitle `json:"subs"`
+// Client represent a Client used to make Search
+type Client struct {
+	scraper  *scraper.Endpoint
+	Endpoint string
 }
 
-// GetSubtitles search for the subtitles from an imdb id
-func GetSubtitles(imdbID string) (map[string][]Subtitle, error) {
-	URL := APIEndpoint + "/" + imdbID
-
-	resp, err := http.Get(URL)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	body, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-
-	// Unmarshal the result
-	var response *Response
-	err = json.Unmarshal(body, &response)
-	if err != nil {
-		return nil, err
-	}
-
-	// No sub found
-	if response.SubtitlesCount == 0 {
-		return nil, ErrNotSubtitleFound
-	}
-
-	// Search for the subs of this movie only
-	res, ok := response.Subtitles[imdbID]
-	if !ok {
-		return nil, ErrNotSubtitleFound
-	}
-
-	return res, nil
-}
-
-// Subtitle is the representation of a subtitle
+// Subtitle represents a Subtitle
 type Subtitle struct {
-	ID            int
-	Rating        int
-	URL           string
-	zipPath       string
-	zipFileReader io.ReadCloser
-	zipReader     *zip.ReadCloser
+	Rating   int
+	Lang     string
+	Uploader string
+	URL      string
+	Title    string
+	reader   io.ReadCloser
 }
 
-// UnmarshalJSON implements the unmarshaler interface
-func (s *Subtitle) UnmarshalJSON(data []byte) error {
-	dataBytes := bytes.NewReader(data)
-	var aux struct {
-		ID     int    `json:"id"`
-		Rating int    `json:"rating"`
-		URL    string `json:"url"`
+// New return a new Searcher
+func New(endpoint string) *Client {
+	e := &scraper.Endpoint{
+		Name:   "yifysubtitles",
+		Method: "GET",
+		List:   "table.other-subs > tbody > tr",
+		Headers: map[string]string{
+			"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_12_4) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/57.0.2988.133 Safari/537.36",
+		},
+		Result: map[string]scraper.Extractors{
+			"rating":   scraper.Extractors{scraper.MustExtractor("td.rating-cell"), scraper.MustExtractor("span")},
+			"lang":     scraper.Extractors{scraper.MustExtractor("td.flag-cell"), scraper.MustExtractor("span.sub-lang")},
+			"title":    scraper.Extractors{scraper.MustExtractor("td:nth-child(3)"), scraper.MustExtractor("a"), scraper.MustExtractor("/subtitle (.*)/")},
+			"uploader": scraper.Extractors{scraper.MustExtractor("td.uploader-cell"), scraper.MustExtractor("a")},
+			"url":      scraper.Extractors{scraper.MustExtractor("td.download-cell"), scraper.MustExtractor("a"), scraper.MustExtractor("@href")},
+		},
+		Debug: false,
 	}
 
-	// Decode json into the aux struct
-	if err := json.NewDecoder(dataBytes).Decode(&aux); err != nil {
-		return err
+	return &Client{
+		scraper:  e,
+		Endpoint: endpoint,
 	}
-
-	// Save the unmarshaled data
-	s.ID = aux.ID
-	s.Rating = aux.Rating
-	s.URL = SubtitleEndpoint + aux.URL
-
-	return nil
 }
 
-// downloadZip downloads the zip file to a tmp directory
-func (s *Subtitle) downloadZip() error {
-	if s.URL == "" {
-		return ErrMissingSubtitleURL
-	}
+// Search will search Subtitles
+func (c *Client) Search(imdbID string) ([]*Subtitle, error) {
+	c.scraper.URL = c.Endpoint + "/movie-imdb/{{imdbId}}"
 
-	if s.zipFileReader != nil {
-		return ErrFileAlreadyDownloaded
+	vars := map[string]string{
+		"imdbId": imdbID,
 	}
+	return c.parseSubtitle(vars)
+}
 
-	resp, err := http.Get(s.URL)
+// SearchByLang will search Subtitles with given language
+// The result will be ordered, with the highest rated subtitle first
+func (c *Client) SearchByLang(imdbID, lang string) ([]*Subtitle, error) {
+	subtitles, err := c.Search(imdbID)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	file, err := ioutil.TempFile(os.TempDir(), "yify")
-	if err != nil {
-		return err
-	}
-	s.zipPath = file.Name()
+	return FilterByLang(subtitles, lang), nil
+}
 
-	defer resp.Body.Close()
-	_, err = io.Copy(file, resp.Body)
+// FilterByLang will filter the subtitles by language
+// The result will be ordered, with the highest rated subtitle first
+func FilterByLang(subtitles []*Subtitle, language string) []*Subtitle {
+	filterredSubtitles := []*Subtitle{}
+	for _, s := range subtitles {
+		if s.Lang == language {
+			filterredSubtitles = append(filterredSubtitles, s)
+		}
+	}
+	sort.Slice(filterredSubtitles, func(i, j int) bool { return filterredSubtitles[i].Rating > filterredSubtitles[j].Rating })
+
+	return filterredSubtitles
+}
+
+// parseSubtitle takes a map of parameters, it will do the request and return
+// the parsed Subtitles
+func (c *Client) parseSubtitle(vars map[string]string) ([]*Subtitle, error) {
+	// Parse the page
+	res, err := c.scraper.Execute(vars)
 	if err != nil {
-		log.Panic(err)
+		return nil, err
 	}
 
-	r, err := zip.OpenReader(file.Name())
+	subtitles := []*Subtitle{}
+
+	// Map the res to our structure
+	decoder, err := mapstructure.NewDecoder(&mapstructure.DecoderConfig{
+		WeaklyTypedInput: true,
+		Result:           &subtitles,
+	})
 	if err != nil {
-		log.Panic(err)
+		return nil, err
+	}
+
+	if err = decoder.Decode(res); err != nil {
+		return nil, err
+	}
+
+	if len(subtitles) == 0 {
+		return nil, ErrNoSubtitleFound
+	}
+
+	// Add the endpoint in front of the URLs
+	for _, s := range subtitles {
+		s.URL = c.Endpoint + s.URL
+	}
+
+	return subtitles, nil
+}
+
+// DownloadZipURL returns the zip file URL of the subtitle
+func (s Subtitle) DownloadZipURL() string {
+	return fmt.Sprintf("%s.zip", strings.Replace(s.URL, "/subtitles/", "/subtitle/", -1))
+}
+
+func getReaderFromURL(url string) (io.ReadCloser, error) {
+	// Download the zip file
+	res, err := http.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	defer res.Body.Close()
+
+	// Read all the body
+	body, err := ioutil.ReadAll(res.Body)
+	if err != nil {
+		return nil, fmt.Errorf("Failed to read response body with error %s", err)
+	}
+
+	// Create a new zip Reader from a newly created bytes reader of the body
+	// already read
+	r, err := zip.NewReader(bytes.NewReader(body), res.ContentLength)
+	if err != nil {
+		return nil, err
 	}
 
 	for _, f := range r.File {
-		rc, err := f.Open()
-		if err != nil {
-			return err
+		if filepath.Ext(f.Name) != ".srt" {
+			continue
 		}
-
-		// Stop at the first file, the zip only contains one file
-		s.zipFileReader = rc
-		break
+		return f.Open()
 	}
-
-	return nil
+	return nil, fmt.Errorf("Empty zip subtitle")
 }
 
 // Read implement the reader interface
 func (s *Subtitle) Read(p []byte) (n int, err error) {
-	if s.zipFileReader == nil {
+	if s.reader == nil {
 		// Download the zip and get the file reader
-		if err := s.downloadZip(); err != nil {
+		r, err := getReaderFromURL(s.DownloadZipURL())
+		if err != nil {
 			return 0, err
 		}
-
-		if s.zipFileReader == nil {
-			return 0, ErrFailedToUnzip
-		}
+		s.reader = r
 	}
 
-	return s.zipFileReader.Read(p)
+	return s.reader.Read(p)
 }
 
 // Close implement the closer interface
-func (s *Subtitle) Close() error {
-	if s.zipFileReader != nil {
-		s.zipFileReader.Close()
+func (s Subtitle) Close() error {
+	if s.reader != nil {
+		return s.reader.Close()
 	}
-
-	if s.zipReader != nil {
-		s.zipReader.Close()
-	}
-
-	os.Remove(s.zipPath)
 
 	return nil
 }
