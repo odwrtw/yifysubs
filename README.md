@@ -2,6 +2,7 @@ YIFY Subtitles client
 =========
 
 [![GoDoc](https://godoc.org/github.com/golang/gddo?status.svg)](http://godoc.org/github.com/odwrtw/yifysubs)
+[![Go Report Card](https://goreportcard.com/badge/github.com/odwrtw/yifysubs)](https://goreportcard.com/report/github.com/odwrtw/yifysubs)
 
 ## Example
 
@@ -14,26 +15,38 @@ import (
 	"os"
 
 	"github.com/odwrtw/yifysubs"
+	"github.com/kr/pretty"
 )
 
 func main() {
-	subs, err := yifysubs.GetSubtitles("tt1243974")
-	if err != nil {
-		log.Panic(err)
-	}
-	fr := subs["french"][0]
+  // Create a client
+  client := yifysubs.New("http://yifysubtitles.com")
 
-	file, err := os.Create("test.srt")
-	if err != nil {
-		log.Panic(err)
-	}
+  // Search subtitles
+  subtitles, err := client.Search("tt0133093")
+  if err != nil {
+      panic(err)
+  }
 
-	defer file.Close()
-	defer fr.Close()
+  // Search subtitles by lang
+  subtitles, err = client.SearchByLang("tt0133093", "French")
+  if err != nil {
+      panic(err)
+  }
 
-	_, err = io.Copy(file, &fr)
-	if err != nil {
-		log.Panic(err)
-	}
+  for _, subtitle := range subtitles {
+    pretty.Println(subtitle)
+    file, err := os.Create("/tmp/tt0133083.fr.srt")
+    if err != nil {
+        panic(err)
+    }
+    defer file.Close()
+    defer subtitle.Close()
+
+    if _, err := io.Copy(file, subtitle); err != nil {
+        panic(err)
+    }
+  }
+
 }
 ```
