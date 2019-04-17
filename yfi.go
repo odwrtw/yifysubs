@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/jpillora/scraper/scraper"
 	"github.com/mitchellh/mapstructure"
@@ -140,7 +141,10 @@ func (s Subtitle) DownloadZipURL() string {
 
 func getReaderFromURL(url string) (io.ReadCloser, error) {
 	// Download the zip file
-	res, err := http.Get(url)
+	var httpClient = &http.Client{
+		Timeout: time.Second * 10,
+	}
+	res, err := httpClient.Get(url)
 	if err != nil {
 		return nil, err
 	}
