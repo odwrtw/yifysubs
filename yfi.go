@@ -150,6 +150,10 @@ func getReaderFromURL(url string) (io.ReadCloser, error) {
 	}
 	defer res.Body.Close()
 
+	if res.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("got http error %q", res.StatusCode)
+	}
+
 	// Read all the body
 	body, err := ioutil.ReadAll(res.Body)
 	if err != nil {
