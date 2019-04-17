@@ -157,7 +157,7 @@ func getReaderFromURL(url string) (io.ReadCloser, error) {
 	// Read all the body
 	body, err := ioutil.ReadAll(res.Body)
 	if err != nil {
-		return nil, fmt.Errorf("Failed to read response body with error %s", err)
+		return nil, fmt.Errorf("failed to read response body with error %s", err)
 	}
 
 	// Create a new zip Reader from a newly created bytes reader of the body
@@ -173,7 +173,7 @@ func getReaderFromURL(url string) (io.ReadCloser, error) {
 		}
 		return f.Open()
 	}
-	return nil, fmt.Errorf("Empty zip subtitle")
+	return nil, fmt.Errorf("empty zip subtitle")
 }
 
 // Read implement the reader interface
