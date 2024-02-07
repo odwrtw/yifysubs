@@ -3,196 +3,207 @@ package yifysubs
 import (
 	"archive/zip"
 	"bytes"
+	"encoding/base64"
 	"errors"
-	"fmt"
 	"io"
-	"net/http"
 	"path/filepath"
-	"sort"
+	"strconv"
 	"strings"
-	"time"
+	"sync"
 
-	"github.com/jpillora/scraper/scraper"
-	"github.com/mitchellh/mapstructure"
+	"github.com/gocolly/colly/v2"
+	"github.com/gocolly/colly/v2/extensions"
 )
 
-// Errors
+const defaultEndpoint = "https://yifysubtitles.me"
+
+// Custom errors
 var (
 	ErrNoSubtitleFound = errors.New("yify: no subtitles found")
+	ErrNoSubtitleData  = errors.New("yify: no subtitles data")
 )
 
 // Client represent a Client used to make Search
 type Client struct {
-	scraper  *scraper.Endpoint
 	Endpoint string
 }
 
-// Subtitle represents a Subtitle
-type Subtitle struct {
-	Rating   int
-	Lang     string
-	Uploader string
-	URL      string
-	Title    string
-	reader   io.ReadCloser
+// New return a new client
+func New(endpoint string) *Client {
+	return &Client{Endpoint: endpoint}
 }
 
-// New return a new Searcher
-func New(endpoint string) *Client {
-	e := &scraper.Endpoint{
-		Name:   "yifysubtitles",
-		Method: "GET",
-		List:   "table.other-subs > tbody > tr",
-		Headers: map[string]string{
-			"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_12_4) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/57.0.2988.133 Safari/537.36",
-		},
-		Result: map[string]scraper.Extractors{
-			"rating":   scraper.Extractors{scraper.MustExtractor("td.rating-cell"), scraper.MustExtractor("span")},
-			"lang":     scraper.Extractors{scraper.MustExtractor("td.flag-cell"), scraper.MustExtractor("span.sub-lang")},
-			"title":    scraper.Extractors{scraper.MustExtractor("td:nth-child(3)"), scraper.MustExtractor("a"), scraper.MustExtractor("/subtitle (.*)/")},
-			"uploader": scraper.Extractors{scraper.MustExtractor("td.uploader-cell"), scraper.MustExtractor("a")},
-			"url":      scraper.Extractors{scraper.MustExtractor("td.download-cell"), scraper.MustExtractor("a"), scraper.MustExtractor("@href")},
-		},
-		Debug: false,
-	}
-
-	return &Client{
-		scraper:  e,
-		Endpoint: endpoint,
-	}
+// NewDefault return a new client with a default endpoint
+func NewDefault() *Client {
+	return &Client{Endpoint: defaultEndpoint}
 }
 
 // Search will search Subtitles
 func (c *Client) Search(imdbID string) ([]*Subtitle, error) {
-	c.scraper.URL = c.Endpoint + "/movie-imdb/{{imdbId}}"
+	var mu sync.Mutex
+	subtitles := []*Subtitle{}
 
-	vars := map[string]string{
-		"imdbId": imdbID,
+	client := colly.NewCollector()
+	extensions.RandomUserAgent(client)
+	extensions.Referer(client)
+
+	client.OnHTML("table.other-subs", func(e *colly.HTMLElement) {
+		e.ForEach("tbody > tr", func(i int, se *colly.HTMLElement) {
+			langSel := se.DOM.Find("td.flag-cell > span.sub-lang")
+			lang, err := langSel.Html()
+			if err != nil {
+				return
+			}
+
+			downloadSel := se.DOM.Find("td:nth-child(3) > a")
+			downloadURL, ok := downloadSel.Attr("href")
+			if !ok {
+				return
+			}
+
+			releasesStr, err := downloadSel.Html()
+			if err != nil {
+				return
+			}
+			releases := strings.Split(releasesStr, "<br/>")
+			for i := range releases {
+				releases[i] = strings.Trim(releases[i], "\n ")
+			}
+
+			mu.Lock()
+			subtitles = append(subtitles, &Subtitle{
+				Lang:     lang,
+				url:      downloadURL,
+				Releases: releases,
+			})
+			mu.Unlock()
+		})
+	})
+
+	endpoint := c.Endpoint + "/movie-imdb/" + imdbID
+	if err := client.Visit(endpoint); err != nil {
+		return nil, err
 	}
-	return c.parseSubtitle(vars)
+	client.Wait()
+
+	return returnSubs(subtitles)
 }
 
-// SearchByLang will search Subtitles with given language
-// The result will be ordered, with the highest rated subtitle first
+// SearchByLang searches Subtitles with given language
 func (c *Client) SearchByLang(imdbID, lang string) ([]*Subtitle, error) {
 	subtitles, err := c.Search(imdbID)
 	if err != nil {
 		return nil, err
 	}
 
-	return FilterByLang(subtitles, lang), nil
+	return FilterByLang(subtitles, lang)
 }
 
 // FilterByLang will filter the subtitles by language
-// The result will be ordered, with the highest rated subtitle first
-func FilterByLang(subtitles []*Subtitle, language string) []*Subtitle {
-	filterredSubtitles := []*Subtitle{}
+func FilterByLang(subtitles []*Subtitle, language string) ([]*Subtitle, error) {
+	subs := []*Subtitle{}
 	for _, s := range subtitles {
 		if s.Lang == language {
-			filterredSubtitles = append(filterredSubtitles, s)
+			subs = append(subs, s)
 		}
 	}
-	sort.Slice(filterredSubtitles, func(i, j int) bool { return filterredSubtitles[i].Rating > filterredSubtitles[j].Rating })
 
-	return filterredSubtitles
+	return returnSubs(subs)
 }
 
-// parseSubtitle takes a map of parameters, it will do the request and return
-// the parsed Subtitles
-func (c *Client) parseSubtitle(vars map[string]string) ([]*Subtitle, error) {
-	// Parse the page
-	res, err := c.scraper.Execute(vars)
-	if err != nil {
-		return nil, err
-	}
-
-	subtitles := []*Subtitle{}
-
-	// Map the res to our structure
-	decoder, err := mapstructure.NewDecoder(&mapstructure.DecoderConfig{
-		WeaklyTypedInput: true,
-		Result:           &subtitles,
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	if err = decoder.Decode(res); err != nil {
-		return nil, err
-	}
-
-	if len(subtitles) == 0 {
+func returnSubs(subs []*Subtitle) ([]*Subtitle, error) {
+	if len(subs) == 0 {
 		return nil, ErrNoSubtitleFound
 	}
 
-	// Add the endpoint in front of the URLs
-	for _, s := range subtitles {
-		s.URL = c.Endpoint + s.URL
-	}
-
-	return subtitles, nil
+	return subs, nil
 }
 
-// DownloadZipURL returns the zip file URL of the subtitle
-func (s Subtitle) DownloadZipURL() string {
-	return fmt.Sprintf("%s.zip", strings.Replace(s.URL, "/subtitles/", "/subtitle/", -1))
-}
-
-func getReaderFromURL(url string) (io.ReadCloser, error) {
-	// Download the zip file
-	var httpClient = &http.Client{
-		Timeout: time.Second * 10,
-	}
-	res, err := httpClient.Get(url)
-	if err != nil {
-		return nil, err
-	}
-	defer res.Body.Close()
-
-	if res.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("got http error %q", res.StatusCode)
-	}
-
-	// Read all the body
-	body, err := io.ReadAll(res.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read response body with error %s", err)
-	}
-
-	// Create a new zip Reader from a newly created bytes reader of the body
-	// already read
-	r, err := zip.NewReader(bytes.NewReader(body), res.ContentLength)
-	if err != nil {
-		return nil, err
-	}
-
-	for _, f := range r.File {
-		if filepath.Ext(f.Name) != ".srt" {
-			continue
-		}
-		return f.Open()
-	}
-	return nil, fmt.Errorf("empty zip subtitle")
+// Subtitle represents a Subtitle
+type Subtitle struct {
+	Lang     string
+	url      string
+	Releases []string
+	buffer   *bytes.Buffer
 }
 
 // Read implement the reader interface
 func (s *Subtitle) Read(p []byte) (n int, err error) {
-	if s.reader == nil {
-		// Download the zip and get the file reader
-		r, err := getReaderFromURL(s.DownloadZipURL())
-		if err != nil {
+	if s.buffer == nil {
+		client := colly.NewCollector()
+		extensions.RandomUserAgent(client)
+		extensions.Referer(client)
+
+		client.OnResponse(func(r *colly.Response) {
+			if r.Headers.Get("Content-Type") != "application/zip" {
+				return
+			}
+
+			lengthStr := r.Headers.Get("Content-Length")
+			length, err := strconv.Atoi(lengthStr)
+			if err != nil {
+				return
+			}
+
+			// Create a new zip.Reader from the response body
+			zr, err := zip.NewReader(bytes.NewReader(r.Body), int64(length))
+			if err != nil {
+				return
+			}
+
+			for _, f := range zr.File {
+				if filepath.Ext(f.Name) != ".srt" {
+					continue
+				}
+
+				file, err := f.Open()
+				if err != nil {
+					return
+				}
+				defer file.Close()
+
+				data, err := io.ReadAll(file)
+				if err != nil {
+					return
+				}
+
+				s.buffer = bytes.NewBuffer(data)
+				return
+			}
+		})
+
+		client.OnHTML("a.download-subtitle", func(e *colly.HTMLElement) {
+			urlEncoded := e.Attr("onclick")
+			parts := strings.Split(urlEncoded, "'")
+			if len(parts) != 3 {
+				return
+			}
+
+			urlEncoded = parts[1]
+			url, err := base64.StdEncoding.DecodeString(urlEncoded)
+			if err != nil {
+				return
+			}
+			client.Visit(string(url))
+		})
+
+		if err := client.Visit(s.url); err != nil {
 			return 0, err
 		}
-		s.reader = r
+		client.Wait()
 	}
 
-	return s.reader.Read(p)
+	if s.buffer == nil {
+		return 0, ErrNoSubtitleData
+	}
+
+	return s.buffer.Read(p)
 }
 
 // Close implement the closer interface
 func (s Subtitle) Close() error {
-	if s.reader != nil {
-		return s.reader.Close()
+	if s.buffer != nil {
+		s.buffer = nil
 	}
 
 	return nil
