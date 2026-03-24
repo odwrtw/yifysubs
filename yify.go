@@ -3,11 +3,11 @@ package yifysubs
 import (
 	"archive/zip"
 	"bytes"
-	"encoding/base64"
 	"errors"
+	"fmt"
 	"io"
+	"net/http"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 
@@ -15,7 +15,7 @@ import (
 	"github.com/gocolly/colly/v2/extensions"
 )
 
-const defaultEndpoint = "https://yifysubtitles.me"
+const defaultEndpoint = "https://yifysubtitles.ch"
 
 // Custom errors
 var (
@@ -60,12 +60,18 @@ func (c *Client) Search(imdbID string) ([]*Subtitle, error) {
 			if !ok {
 				return
 			}
+			downloadURL = se.Request.AbsoluteURL(downloadURL)
 
-			releasesStr, err := downloadSel.Html()
+			// Strip the leading <span> tag and normalize <br /> variants
+			linkClone := downloadSel.Clone()
+			linkClone.Find("span").Remove()
+			releasesStr, err := linkClone.Html()
 			if err != nil {
 				return
 			}
-			releases := strings.Split(releasesStr, "<br/>")
+			releasesStr = strings.ReplaceAll(releasesStr, "<br/>", "\n")
+			releasesStr = strings.ReplaceAll(releasesStr, "<br />", "\n")
+			releases := strings.Split(releasesStr, "\n")
 			for i := range releases {
 				releases[i] = strings.Trim(releases[i], "\n ")
 			}
@@ -73,7 +79,7 @@ func (c *Client) Search(imdbID string) ([]*Subtitle, error) {
 			mu.Lock()
 			subtitles = append(subtitles, &Subtitle{
 				Lang:     lang,
-				url:      downloadURL,
+				URL:      downloadURL,
 				Releases: releases,
 			})
 			mu.Unlock()
@@ -122,7 +128,7 @@ func returnSubs(subs []*Subtitle) ([]*Subtitle, error) {
 // Subtitle represents a Subtitle
 type Subtitle struct {
 	Lang     string
-	url      string
+	URL      string
 	Releases []string
 	buffer   *bytes.Buffer
 }
@@ -130,67 +136,9 @@ type Subtitle struct {
 // Read implement the reader interface
 func (s *Subtitle) Read(p []byte) (n int, err error) {
 	if s.buffer == nil {
-		client := colly.NewCollector()
-		extensions.RandomUserAgent(client)
-		extensions.Referer(client)
-
-		client.OnResponse(func(r *colly.Response) {
-			if r.Headers.Get("Content-Type") != "application/zip" {
-				return
-			}
-
-			lengthStr := r.Headers.Get("Content-Length")
-			length, err := strconv.Atoi(lengthStr)
-			if err != nil {
-				return
-			}
-
-			// Create a new zip.Reader from the response body
-			zr, err := zip.NewReader(bytes.NewReader(r.Body), int64(length))
-			if err != nil {
-				return
-			}
-
-			for _, f := range zr.File {
-				if filepath.Ext(f.Name) != ".srt" {
-					continue
-				}
-
-				file, err := f.Open()
-				if err != nil {
-					return
-				}
-				defer file.Close()
-
-				data, err := io.ReadAll(file)
-				if err != nil {
-					return
-				}
-
-				s.buffer = bytes.NewBuffer(data)
-				return
-			}
-		})
-
-		client.OnHTML("a.download-subtitle", func(e *colly.HTMLElement) {
-			urlEncoded := e.Attr("onclick")
-			parts := strings.Split(urlEncoded, "'")
-			if len(parts) != 3 {
-				return
-			}
-
-			urlEncoded = parts[1]
-			url, err := base64.StdEncoding.DecodeString(urlEncoded)
-			if err != nil {
-				return
-			}
-			client.Visit(string(url))
-		})
-
-		if err := client.Visit(s.url); err != nil {
+		if err := s.download(); err != nil {
 			return 0, err
 		}
-		client.Wait()
 	}
 
 	if s.buffer == nil {
@@ -198,6 +146,58 @@ func (s *Subtitle) Read(p []byte) (n int, err error) {
 	}
 
 	return s.buffer.Read(p)
+}
+
+func (s *Subtitle) download() error {
+	zipURL := strings.Replace(s.URL, "/subtitles/", "/subtitle/", 1) + ".zip"
+
+	req, err := http.NewRequest(http.MethodGet, zipURL, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Referer", s.URL)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("yify: unexpected status %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+
+	zr, err := zip.NewReader(bytes.NewReader(body), int64(len(body)))
+	if err != nil {
+		return err
+	}
+
+	for _, f := range zr.File {
+		if filepath.Ext(f.Name) != ".srt" {
+			continue
+		}
+
+		rc, err := f.Open()
+		if err != nil {
+			return err
+		}
+		defer rc.Close()
+
+		data, err := io.ReadAll(rc)
+		if err != nil {
+			return err
+		}
+
+		s.buffer = bytes.NewBuffer(data)
+		return nil
+	}
+
+	return ErrNoSubtitleData
 }
 
 // Close implement the closer interface
